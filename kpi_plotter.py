@@ -4,14 +4,13 @@ def generate_report(jql, graphs_to_generate):
     import pandas as pd
     import matplotlib.pyplot as plt
     import json
-    from datetime import datetime
-
 
     # =========================
     # JIRA API CONFIG
     # =========================
 
     JIRA_URL = "https://jira.tandemdiabetes.com:8443"
+    STORY_POINTS_FIELD = "customfield_10006"
 
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     PAT_FILE = os.path.join(SCRIPT_DIR, "JIRA_PAT.json")
@@ -32,12 +31,14 @@ def generate_report(jql, graphs_to_generate):
         "Accept": "application/json"
     }
 
-    
-
+    # =========================
+    # DOWNLOAD JIRA ISSUES WITH PAGINATION
+    # =========================
 
     all_issues = []
     start_at = 0
     page_size = 1000
+    total_issues = None
 
     while True:
         response = requests.get(
@@ -46,30 +47,35 @@ def generate_report(jql, graphs_to_generate):
             params={
                 "jql": jql,
                 "startAt": start_at,
-                "maxResults": page_size
+                "maxResults": page_size,
+                "fields": f"summary,status,created,resolutiondate,{STORY_POINTS_FIELD}"
             }
         )
 
         response.raise_for_status()
         data = response.json()
 
-        issues = data["issues"]
+        issues = data.get("issues", [])
+        total_issues = data.get("total", 0)
+
         all_issues.extend(issues)
 
-        print(f"Downloaded {len(all_issues)} of {data['total']} issues")
+        print(f"Downloaded {len(all_issues)} of {total_issues} issues")
 
-        if start_at + len(issues) >= data["total"]:
+        if len(issues) == 0:
+            break
+
+        if start_at + len(issues) >= total_issues:
             break
 
         start_at += len(issues)
 
+    print(f"Total matching issues: {total_issues}")
     print(f"Total issues retrieved: {len(all_issues)}")
-    response.raise_for_status()
 
-    data = response.json()
-
-    print("Total matching issues:", data["total"])
-    print("Returned issues:", len(data["issues"]))
+    # =========================
+    # BUILD DATAFRAME
+    # =========================
 
     rows = []
 
@@ -81,10 +87,15 @@ def generate_report(jql, graphs_to_generate):
             "Summary": fields.get("summary"),
             "Status": fields.get("status", {}).get("name"),
             "Created": fields.get("created"),
-            "Resolved": fields.get("resolutiondate")
+            "Resolved": fields.get("resolutiondate"),
+            "StoryPoints": fields.get(STORY_POINTS_FIELD)
         })
 
     df = pd.DataFrame(rows)
+
+    if df.empty:
+        print("No issues found for this JQL.")
+        return
 
     df["Created"] = pd.to_datetime(
         df["Created"],
@@ -98,16 +109,29 @@ def generate_report(jql, graphs_to_generate):
         utc=True
     ).dt.tz_localize(None)
 
+    df["StoryPoints"] = pd.to_numeric(
+        df["StoryPoints"],
+        errors="coerce"
+    ).fillna(0)
+
     print(f"Downloaded {len(df)} issues from Jira")
     print(df.head())
     print(df.columns)
     print(df["Status"].value_counts())
-    print(df.head())
+    print(df[["Key", "StoryPoints"]].head(20))
+    print(f"Total Story Points in Downloaded Issues: {df['StoryPoints'].sum()}")
+
+    # Remove rows with invalid created dates
+    df = df[df["Created"].notna()].copy()
+
+    if df.empty:
+        print("No issues have valid Created dates.")
+        return
+
     # =========================
     # CONFIG
     # =========================
 
-    # Age buckets
     BUCKETS = [
         (0, 30),
         (31, 60),
@@ -122,24 +146,32 @@ def generate_report(jql, graphs_to_generate):
         "91-120 Days since Opened"
     ]
 
-    story_quantity = 0
+    # =========================
+    # BASIC COUNTS
+    # =========================
 
-    # Count stories created and resolved in the full CSV
     created_quantity = int(df["Created"].notna().sum())
     resolved_quantity = int(df["Resolved"].notna().sum())
 
     print(f"Total stories created in CSV: {created_quantity}")
     print(f"Total stories resolved in CSV: {resolved_quantity}")
 
-    # Calculate monthly averages over the full CSV time frame
     valid_created = df["Created"].dropna()
     valid_resolved = df["Resolved"].dropna()
 
-    if not valid_created.empty or not valid_resolved.empty:
-        start_date = min(valid_created.min(), valid_resolved.min()).normalize()
-        end_date = max(valid_created.max(), valid_resolved.max()).normalize()
-        month_count = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month) + 1
+    all_valid_dates = pd.concat([valid_created, valid_resolved])
+
+    if not all_valid_dates.empty:
+        csv_range_start = all_valid_dates.min().normalize()
+        csv_range_end = all_valid_dates.max().normalize()
+        month_count = (
+            (csv_range_end.year - csv_range_start.year) * 12
+            + (csv_range_end.month - csv_range_start.month)
+            + 1
+        )
     else:
+        csv_range_start = df["Created"].min().normalize()
+        csv_range_end = pd.Timestamp.today().normalize()
         month_count = 1
 
     month_count = max(month_count, 1)
@@ -150,7 +182,10 @@ def generate_report(jql, graphs_to_generate):
     print(f"Average stories created per month: {avg_created_per_month:.2f}")
     print(f"Average stories resolved per month: {avg_resolved_per_month:.2f}")
 
-    # Rolling monthly averages for created and resolved stories
+    # =========================
+    # MONTHLY CREATED AND RESOLVED ROLLING AVERAGES
+    # =========================
+
     created_monthly = (
         df["Created"]
         .dropna()
@@ -167,23 +202,39 @@ def generate_report(jql, graphs_to_generate):
         .sort_index()
     )
 
-    month_index = pd.period_range(
-        start=min(created_monthly.index.min(), resolved_monthly.index.min()),
-        end=max(created_monthly.index.max(), resolved_monthly.index.max()),
-        freq="M"
-    )
+    if created_monthly.empty and resolved_monthly.empty:
+        month_index = pd.period_range(
+            start=df["Created"].min().to_period("M"),
+            end=pd.Timestamp.today().to_period("M"),
+            freq="M"
+        )
+    elif created_monthly.empty:
+        month_index = pd.period_range(
+            start=resolved_monthly.index.min(),
+            end=resolved_monthly.index.max(),
+            freq="M"
+        )
+    elif resolved_monthly.empty:
+        month_index = pd.period_range(
+            start=created_monthly.index.min(),
+            end=created_monthly.index.max(),
+            freq="M"
+        )
+    else:
+        month_index = pd.period_range(
+            start=min(created_monthly.index.min(), resolved_monthly.index.min()),
+            end=max(created_monthly.index.max(), resolved_monthly.index.max()),
+            freq="M"
+        )
 
     created_monthly = created_monthly.reindex(month_index, fill_value=0).astype(int)
     resolved_monthly = resolved_monthly.reindex(month_index, fill_value=0).astype(int)
 
-    created_roll = created_monthly.rolling(window=3, min_periods=3).mean()
-    resolved_roll = resolved_monthly.rolling(window=3, min_periods=3).mean()
-
-    # Remove rows with invalid created dates
-    df = df[df["Created"].notna()].copy()
+    created_roll = created_monthly.rolling(window=3, min_periods=1).mean()
+    resolved_roll = resolved_monthly.rolling(window=3, min_periods=1).mean()
 
     # =========================
-    # BUILD DATE RANGE
+    # BUILD DAILY DATE RANGE FOR OPEN STORY AGING
     # =========================
 
     start_date = df["Created"].min().normalize()
@@ -196,30 +247,12 @@ def generate_report(jql, graphs_to_generate):
     )
 
     # =========================
-    # ARRAY OF ARRAYS
+    # OPEN STORY AGE BUCKETS
     # =========================
-
-    # Each entry:
-    # [
-    #   current_date,
-    #   [bucket0, bucket1, bucket2, bucket3]
-    # ]
-    #
-    # Example:
-    # [
-    #   2026-01-01,
-    #   [12, 4, 2, 1]
-    # ]
 
     results = []
 
-
-    # =========================
-    # MAIN LOOP
-    # =========================
-
     for current_date in all_dates:
-
         bucket_counts = [0] * len(BUCKETS)
 
         open_stories = df[
@@ -233,40 +266,101 @@ def generate_report(jql, graphs_to_generate):
         ]
 
         for _, story in open_stories.iterrows():
-
             age_days = (current_date - story["Created"]).days
 
             for bucket_index, (min_age, max_age) in enumerate(BUCKETS):
-
                 if min_age <= age_days <= max_age:
                     bucket_counts[bucket_index] += 1
                     break
 
-        results.append(
-            [
-                current_date,
-                bucket_counts
-            ]
-        )
-
-    # =========================
-    # EXTRACT SERIES
-    # =========================
+        results.append([
+            current_date,
+            bucket_counts
+        ])
 
     plot_dates = []
     bucket_series = [[] for _ in range(len(BUCKETS))]
 
     for date_value, bucket_values in results:
-
         plot_dates.append(date_value)
 
         for i in range(len(BUCKETS)):
             bucket_series[i].append(bucket_values[i])
 
     # =========================
-    # PLOT
+    # SHARED DATA FOR CLOSURE AGE AND BUG GRAPHS
     # =========================
+
+    resolved_age_df = df[
+        df["Created"].notna() & df["Resolved"].notna()
+    ].copy()
+
+    if not resolved_age_df.empty:
+        resolved_age_df["AgeAtResolutionDays"] = (
+            resolved_age_df["Resolved"] - resolved_age_df["Created"]
+        ).dt.days
+
+        daily_avg_age = (
+            resolved_age_df
+            .assign(CloseDate=resolved_age_df["Resolved"].dt.normalize())
+            .groupby("CloseDate", as_index=False)["AgeAtResolutionDays"]
+            .mean()
+            .sort_values("CloseDate")
+        )
+
+        daily_avg_age["RollingAvgAge"] = (
+            daily_avg_age["AgeAtResolutionDays"]
+            .rolling(window=7, min_periods=1)
+            .mean()
+        )
+    else:
+        daily_avg_age = pd.DataFrame(
+            columns=["CloseDate", "AgeAtResolutionDays", "RollingAvgAge"]
+        )
+
+    bug_df = df.loc[
+        df["Summary"].fillna("").str.contains("bug", case=False, na=False),
+        ["Created", "Resolved", "Summary"]
+    ].copy()
+
+    bug_df = bug_df[bug_df["Created"].notna()].copy()
+
+    bug_resolved_age_df = bug_df[
+        bug_df["Created"].notna() & bug_df["Resolved"].notna()
+    ].copy()
+
+    if not bug_resolved_age_df.empty:
+        bug_resolved_age_df["AgeAtResolutionDays"] = (
+            bug_resolved_age_df["Resolved"] - bug_resolved_age_df["Created"]
+        ).dt.days
+
+        bug_daily_avg_age = (
+            bug_resolved_age_df
+            .assign(CloseDate=bug_resolved_age_df["Resolved"].dt.normalize())
+            .groupby("CloseDate", as_index=False)["AgeAtResolutionDays"]
+            .mean()
+            .sort_values("CloseDate")
+        )
+
+        bug_daily_avg_age["BugRollingAvgAge"] = (
+            bug_daily_avg_age["AgeAtResolutionDays"]
+            .rolling(window=7, min_periods=1)
+            .mean()
+        )
+    else:
+        bug_daily_avg_age = pd.DataFrame(
+            columns=["CloseDate", "AgeAtResolutionDays", "BugRollingAvgAge"]
+        )
+
+    # =========================
+    # PLOTS
+    # =========================
+
     saved_figures = []
+
+    # =========================
+    # GRAPH 1: STORY THROUGHPUT AND AGING
+    # =========================
 
     if "throughput" in graphs_to_generate:
         fig1 = plt.figure(figsize=(14, 8))
@@ -300,202 +394,246 @@ def generate_report(jql, graphs_to_generate):
         plt.ylabel("Number of Stories")
         plt.legend()
         plt.grid(True)
-
         plt.tight_layout()
 
-        resolved_age_df = df[
-            df["Created"].notna() & df["Resolved"].notna()
-        ].copy()
-
-        resolved_age_df["AgeAtResolutionDays"] = (
-            resolved_age_df["Resolved"] - resolved_age_df["Created"]
-        ).dt.days
-
-        daily_avg_age = (
-            resolved_age_df
-            .assign(CloseDate=resolved_age_df["Resolved"].dt.normalize())
-            .groupby("CloseDate", as_index=False)["AgeAtResolutionDays"]
-            .mean()
-            .sort_values("CloseDate")
-        )
-
-        daily_avg_age["RollingAvgAge"] = (
-            daily_avg_age["AgeAtResolutionDays"].rolling(window=7, min_periods=1).mean()
-        )
-
-        bug_df = df.loc[
-            df["Summary"].fillna("").str.contains("bug", case=False, na=False),
-            ["Created", "Resolved", "Summary"]
-        ].copy()
-
-        bug_df = bug_df[bug_df["Created"].notna()].copy()
-
-        bug_resolved_age_df = bug_df[
-            bug_df["Created"].notna() & bug_df["Resolved"].notna()
-        ].copy()
-
-        bug_resolved_age_df["AgeAtResolutionDays"] = (
-            bug_resolved_age_df["Resolved"] - bug_resolved_age_df["Created"]
-        ).dt.days
-
-        bug_daily_avg_age = (
-            bug_resolved_age_df
-            .assign(CloseDate=bug_resolved_age_df["Resolved"].dt.normalize())
-            .groupby("CloseDate", as_index=False)["AgeAtResolutionDays"]
-            .mean()
-            .sort_values("CloseDate")
-        )
-
-        bug_daily_avg_age["BugRollingAvgAge"] = (
-            bug_daily_avg_age["AgeAtResolutionDays"].rolling(window=7, min_periods=1).mean()
-        )
+    # =========================
+    # GRAPH 2: AVERAGE AGE AT CLOSURE
+    # =========================
 
     if "closure_age" in graphs_to_generate:
-    
-        fig2 = plt.figure(figsize=(14, 6))
-        saved_figures.append(("average_age_closed_per_day", fig2))
-        # plt.plot(
-        #     daily_avg_age["CloseDate"],
-        #     daily_avg_age["AgeAtResolutionDays"],
-        #     marker="o",
-        #     linewidth=2,
-        #     color="royalblue",
-        #     label="Daily Avg Age"
-        # )
-        plt.plot(
-            daily_avg_age["CloseDate"],
-            daily_avg_age["RollingAvgAge"],
-            linewidth=2.5,
-            color="darkorange",
-            label="All Stories"
-        )
-        plt.plot(
-            bug_daily_avg_age["CloseDate"],
-            bug_daily_avg_age["BugRollingAvgAge"],
-            linewidth=2.5,
-            color="forestgreen",
-            label="Only Bugs"
-        )
-        plt.title("Age of Tickets when Closed; 7 Day Rolling Average ")
-        plt.xlabel("Date")
-        plt.ylabel("Average Age at Closure (Days)")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
+        if daily_avg_age.empty:
+            print("No resolved issues found for Average Age at Closure graph.")
+        else:
+            fig2 = plt.figure(figsize=(14, 6))
+            saved_figures.append(("average_age_closed_per_day", fig2))
 
-        
+            plt.plot(
+                daily_avg_age["CloseDate"],
+                daily_avg_age["RollingAvgAge"],
+                linewidth=2.5,
+                color="darkorange",
+                label="All Stories"
+            )
+
+            if not bug_daily_avg_age.empty:
+                plt.plot(
+                    bug_daily_avg_age["CloseDate"],
+                    bug_daily_avg_age["BugRollingAvgAge"],
+                    linewidth=2.5,
+                    color="forestgreen",
+                    label="Only Bugs"
+                )
+
+            plt.title("Age of Tickets When Closed; 7 Day Rolling Average")
+            plt.xlabel("Date")
+            plt.ylabel("Average Age at Closure (Days)")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+
+    # =========================
+    # GRAPH 3: BUG STORIES CREATED VS OPEN
+    # =========================
 
     if "bugs" in graphs_to_generate:
-        #print("Bug stories detected:")
-        for _, row in bug_df.sort_values("Created").iterrows():
-            created_str = row["Created"].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(row["Created"]) else "NA"
-            resolved_str = row["Resolved"].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(row["Resolved"]) else "NA"
-            summary = row["Summary"] if pd.notna(row["Summary"]) else ""
-            print(f"- Created: {created_str} | Resolved: {resolved_str} | Summary: {summary}")
-
-        #print(f"Total bug stories found: {len(bug_df)}")
-
-        bug_story_counts = (
-            bug_df
-            .assign(CreatedDate=lambda x: x["Created"].dt.normalize())
-            .groupby("CreatedDate", as_index=False)
-            .size()
-            .rename(columns={"size": "BugStoriesCreated"})
-            .sort_values("CreatedDate")
-        )
-
-        csv_range_start = min(valid_created.min(), valid_resolved.min()).normalize()
-        csv_range_end = max(valid_created.max(), valid_resolved.max()).normalize()
-
-        bug_date_range = pd.date_range(
-            start=csv_range_start,
-            end=csv_range_end,
-            freq="D"
-        )
-
-        bug_daily_series = pd.DataFrame({"CreatedDate": bug_date_range})
-        bug_daily_series = bug_daily_series.merge(
-            bug_story_counts,
-            on="CreatedDate",
-            how="left"
-        )
-        bug_daily_series["BugStoriesCreated"] = bug_daily_series["BugStoriesCreated"].fillna(0).astype(int)
-
-        bug_open_counts = []
-        for current_date in bug_date_range:
-            open_bug_stories = bug_df[
-                (bug_df["Created"] <= current_date)
-                &
-                (
-                    bug_df["Resolved"].isna()
-                    |
-                    (bug_df["Resolved"] > current_date)
-                )
-            ]
-            bug_open_counts.append(int(open_bug_stories.shape[0]))
-
-        bug_daily_series["BugStoriesOpen"] = bug_open_counts
-
-        positive_open_days = int((bug_daily_series["BugStoriesOpen"] > 0).sum())
-        zero_open_days = int((bug_daily_series["BugStoriesOpen"] == 0).sum())
-
-        if zero_open_days == 0:
-            uptime_ratio = float("inf") if positive_open_days > 0 else 0.0
+        if bug_df.empty:
+            print("No bug-related stories found for Bug Stories graph.")
         else:
-            uptime_ratio = 1 - (positive_open_days / (csv_range_end - csv_range_start).days)
+            for _, row in bug_df.sort_values("Created").iterrows():
+                created_str = row["Created"].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(row["Created"]) else "NA"
+                resolved_str = row["Resolved"].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(row["Resolved"]) else "NA"
+                summary = row["Summary"] if pd.notna(row["Summary"]) else ""
+                print(f"- Created: {created_str} | Resolved: {resolved_str} | Summary: {summary}")
 
-        print(f"%Uptime (% of days with 0 bugs open): {uptime_ratio:.4f}")
-        fig3 = plt.figure(figsize=(14, 6))
-        saved_figures.append(("bug_stories_created_vs_open", fig3))
-        plt.plot(
-            bug_daily_series["CreatedDate"],
-            bug_daily_series["BugStoriesCreated"],
-            marker="o",
-            linewidth=2,
-            color="crimson",
-            label="Bug Stories Created"
-        )
-        plt.plot(
-            bug_daily_series["CreatedDate"],
-            bug_daily_series["BugStoriesOpen"],
-            marker="s",
-            linewidth=2,
-            color="royalblue",
-            label="Bug Stories Open"
-        )
-        plt.title("Bug-Related Stories Created vs Open per Day")
-        plt.xlabel("Date")
-        plt.ylabel("Number of Bug Stories")
-        plt.legend()
-        plt.grid(True)
-        plt.text(
-            0.02,
-            0.98,
-            f"% of days with no bugs open: {uptime_ratio:.2%}",
-            transform=plt.gca().transAxes,
-            fontsize=11,
-            verticalalignment="top",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8)
-        )
-        plt.tight_layout()
+            bug_story_counts = (
+                bug_df
+                .assign(CreatedDate=lambda x: x["Created"].dt.normalize())
+                .groupby("CreatedDate", as_index=False)
+                .size()
+                .rename(columns={"size": "BugStoriesCreated"})
+                .sort_values("CreatedDate")
+            )
 
-    save_plots = "n" #input("Save generated plots to 'KPI Plots' folder? (yes/no): ").strip().lower()
+            bug_date_range = pd.date_range(
+                start=csv_range_start,
+                end=csv_range_end,
+                freq="D"
+            )
+
+            bug_daily_series = pd.DataFrame({"CreatedDate": bug_date_range})
+
+            bug_daily_series = bug_daily_series.merge(
+                bug_story_counts,
+                on="CreatedDate",
+                how="left"
+            )
+
+            bug_daily_series["BugStoriesCreated"] = (
+                bug_daily_series["BugStoriesCreated"]
+                .fillna(0)
+                .astype(int)
+            )
+
+            bug_open_counts = []
+
+            for current_date in bug_date_range:
+                open_bug_stories = bug_df[
+                    (bug_df["Created"] <= current_date)
+                    &
+                    (
+                        bug_df["Resolved"].isna()
+                        |
+                        (bug_df["Resolved"] > current_date)
+                    )
+                ]
+
+                bug_open_counts.append(int(open_bug_stories.shape[0]))
+
+            bug_daily_series["BugStoriesOpen"] = bug_open_counts
+
+            positive_open_days = int((bug_daily_series["BugStoriesOpen"] > 0).sum())
+            zero_open_days = int((bug_daily_series["BugStoriesOpen"] == 0).sum())
+
+            total_days = max((csv_range_end - csv_range_start).days, 1)
+
+            if zero_open_days == 0:
+                uptime_ratio = 0.0
+            else:
+                uptime_ratio = zero_open_days / total_days
+
+            print(f"%Uptime (% of days with 0 bugs open): {uptime_ratio:.4f}")
+
+            fig3 = plt.figure(figsize=(14, 6))
+            saved_figures.append(("bug_stories_created_vs_open", fig3))
+
+            plt.plot(
+                bug_daily_series["CreatedDate"],
+                bug_daily_series["BugStoriesCreated"],
+                marker="o",
+                linewidth=2,
+                color="crimson",
+                label="Bug Stories Created"
+            )
+
+            plt.plot(
+                bug_daily_series["CreatedDate"],
+                bug_daily_series["BugStoriesOpen"],
+                marker="s",
+                linewidth=2,
+                color="royalblue",
+                label="Bug Stories Open"
+            )
+
+            plt.title("Bug-Related Stories Created vs Open per Day")
+            plt.xlabel("Date")
+            plt.ylabel("Number of Bug Stories")
+            plt.legend()
+            plt.grid(True)
+
+            plt.text(
+                0.02,
+                0.98,
+                f"% of days with no bugs open: {uptime_ratio:.2%}",
+                transform=plt.gca().transAxes,
+                fontsize=11,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8)
+            )
+
+            plt.tight_layout()
+
+    # =========================
+    # GRAPH 4: STORY POINTS COMPLETED PER WEEK
+    # =========================
+
+    if "story_points_biweekly" in graphs_to_generate:
+        completed_points_df = df[
+            df["Resolved"].notna()
+        ].copy()
+
+        if completed_points_df.empty:
+            print("No resolved issues found for Story Points Completed Per Week graph.")
+        else:
+            completed_points_weekly = (
+                completed_points_df
+                .set_index("Resolved")
+                .resample("2W")["StoryPoints"]
+                .sum()
+            )
+
+            completed_points_weekly = completed_points_weekly.sort_index()
+
+            completed_points_weekly_df = completed_points_weekly.reset_index()
+            completed_points_weekly_df.columns = ["2WeekEnding", "StoryPointsCompleted"]
+
+            completed_points_weekly_df["RollingAvgStoryPoints"] = (
+                completed_points_weekly_df["StoryPointsCompleted"]
+                .rolling(window=3, min_periods=1)
+                .mean()
+            )
+
+            print("Story Points Completed Per Sprint (2 Weeks):")
+            print(completed_points_weekly_df)
+
+            fig4 = plt.figure(figsize=(14, 6))
+            saved_figures.append(("story_points_completed_per_2week", fig4))
+
+            plt.bar(
+                completed_points_weekly_df["2WeekEnding"],
+                completed_points_weekly_df["StoryPointsCompleted"],
+                color="steelblue",
+                label="Story Points Completed Per Sprint (2 Weeks)"
+            )
+
+            plt.plot(
+                completed_points_weekly_df["2WeekEnding"],
+                completed_points_weekly_df["RollingAvgStoryPoints"],
+                color="darkorange",
+                linewidth=2.5,
+                marker="o",
+                label="3-Sprint Rolling Average"
+            )
+
+            plt.title("Story Points Completed Per Sprint Over Time")
+            plt.xlabel("Sprint Ending")
+            plt.ylabel("Story Points Completed")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+
+    # =========================
+    # SAVE PLOTS OPTION
+    # =========================
+
+    save_plots = "n"
 
     if save_plots in {"yes", "y"}:
         output_dir = os.path.join(SCRIPT_DIR, "KPI Plots")
         os.makedirs(output_dir, exist_ok=True)
+
         for filename, figure in saved_figures:
             output_path = os.path.join(output_dir, f"{filename}.png")
             figure.savefig(output_path, dpi=300, bbox_inches="tight")
             print(f"Saved plot: {output_path}")
 
-    plt.show()
+    if saved_figures:
+        plt.show()
+    else:
+        print("No graphs were selected.")
 
 
 if __name__ == "__main__":
-    generate_report("""
-         issuetype = Story 
-         AND project = ECCO
-         AND created >= -365d
-         AND assignee in (rcheesman, ejuric, tcao, jtiu, awalsh, msaiger)
-         """)
+    generate_report(
+        """
+        issuetype = Story
+        AND project = ECCO
+        AND created >= -365d
+        AND assignee in (rcheesman, ejuric, tcao, jtiu, awalsh, msaiger)
+        """,
+        [
+            "throughput",
+            "closure_age",
+            "bugs",
+            "story_points_weekly"
+        ]
+    )
