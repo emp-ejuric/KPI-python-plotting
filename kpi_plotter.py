@@ -1,9 +1,11 @@
-def generate_report(jql, graphs_to_generate):
+from getpass import getpass
+
+
+def generate_report(jql, graphs_to_generate, pat, status_callback=None):
     import requests
     import os
     import pandas as pd
     import matplotlib.pyplot as plt
-    import json
 
     # =========================
     # JIRA API CONFIG
@@ -13,21 +15,18 @@ def generate_report(jql, graphs_to_generate):
     STORY_POINTS_FIELD = "customfield_10006"
 
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    PAT_FILE = os.path.join(SCRIPT_DIR, "JIRA_PAT.json")
 
-    if not os.path.exists(PAT_FILE):
-        raise FileNotFoundError(f"PAT file not found: {PAT_FILE}")
+    if not pat:
+        raise ValueError("Enter a Jira PAT")
 
-    with open(PAT_FILE, "r") as f:
-        config = json.load(f)
-
-    PAT = config.get("pat")
-
-    if not PAT:
-        raise ValueError("No 'pat' field found in JIRA_PAT.json")
+    def report_status(message):
+        if status_callback:
+            status_callback(message)
+        else:
+            print(message)
 
     headers = {
-        "Authorization": f"Bearer {PAT}",
+        "Authorization": f"Bearer {pat}",
         "Accept": "application/json"
     }
 
@@ -60,7 +59,7 @@ def generate_report(jql, graphs_to_generate):
 
         all_issues.extend(issues)
 
-        print(f"Downloaded {len(all_issues)} of {total_issues} issues")
+        report_status(f"Downloaded {len(all_issues)} of {total_issues} issues")
 
         if len(issues) == 0:
             break
@@ -70,8 +69,9 @@ def generate_report(jql, graphs_to_generate):
 
         start_at += len(issues)
 
-    print(f"Total matching issues: {total_issues}")
-    print(f"Total issues retrieved: {len(all_issues)}")
+    report_status(f"Total matching issues: {total_issues}")
+    report_status(f"Total issues retrieved: {len(all_issues)}")
+    report_status("Generating Report")
 
     # =========================
     # BUILD DATAFRAME
@@ -94,8 +94,8 @@ def generate_report(jql, graphs_to_generate):
     df = pd.DataFrame(rows)
 
     if df.empty:
-        print("No issues found for this JQL.")
-        return
+        report_status("No issues found for this JQL.")
+        return False
 
     df["Created"] = pd.to_datetime(
         df["Created"],
@@ -114,7 +114,7 @@ def generate_report(jql, graphs_to_generate):
         errors="coerce"
     ).fillna(0)
 
-    print(f"Downloaded {len(df)} issues from Jira")
+    report_status(f"Downloaded {len(df)} issues from Jira")
     print(df.head())
     print(df.columns)
     print(df["Status"].value_counts())
@@ -635,5 +635,6 @@ if __name__ == "__main__":
             "closure_age",
             "bugs",
             "story_points_weekly"
-        ]
+        ],
+        getpass("Jira PAT: ")
     )

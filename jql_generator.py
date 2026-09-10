@@ -2,8 +2,6 @@ import tkinter as tk
 from tkinter import ttk
 from kpi_plotter import generate_report
 import threading
-import json
-import os
 import requests
 
 JIRA_API_URL = "https://jira.tandemdiabetes.com:8443/rest/api/2"
@@ -14,7 +12,7 @@ JIRA_API_URL = "https://jira.tandemdiabetes.com:8443/rest/api/2"
 #================================
 root = tk.Tk()
 root.title("Jira KPI Report Generator")
-root.geometry("600x500")
+root.geometry("600x650")
 
 
 status_label = tk.Label(root, text="Ready")
@@ -25,17 +23,28 @@ status_label.grid(row=99, column=0, columnspan=2, pady=5)
 # INPUT FIELDS
 #================================
 
-#Date Created
-tk.Label(root, text="Days since created").grid(row=0, column=0, padx=8, pady=4)
+# Jira PAT
+tk.Label(root, text="Jira PAT").grid(row=1, column=0, padx=8, pady=4)
+pat_entry = tk.Entry(root, width=37, show="*")
+pat_entry.grid(row=1, column=1, padx=8, pady=4)
+
+# Instructions
+tk.Label(
+    root,
+    text="Instructions:\n1. Enter Jira PAT     2. Enter JQL search parameters      3. Select Graphs        4. Click Generate Report"
+).grid(row=0, column=0, columnspan=4, padx=8, pady=4, sticky="w")
+
+# Date Created
+tk.Label(root, text="Days since created").grid(row=2, column=0, padx=8, pady=4)
 date_entry = tk.Entry(root)
 date_entry.insert(0, "365")
-date_entry.grid(row=0, column=1, padx=8, pady=4)
+date_entry.grid(row=2, column=1, padx=8, pady=4)
 
 # Project
-tk.Label(root, text="Project").grid(row=1, column=0, padx=8, pady=4)
+tk.Label(root, text="Project").grid(row=3, column=0, padx=8, pady=4)
 project_entry = ttk.Combobox(root, width=37)
 project_entry.insert(0, "ECCO")
-project_entry.grid(row=1, column=1, padx=8, pady=4)
+project_entry.grid(row=3, column=1, padx=8, pady=4)
 project_options = []
 component_options = []
 assignee_options = []
@@ -44,15 +53,9 @@ issue_options = default_issue_options.copy()
 all_issue_options = default_issue_options.copy()
 
 
-def jira_headers():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    pat_file = os.path.join(script_dir, "JIRA_PAT.json")
-
-    with open(pat_file, "r") as file:
-        pat = json.load(file).get("pat")
-
+def jira_headers(pat):
     if not pat:
-        raise ValueError("No 'pat' field found in JIRA_PAT.json")
+        raise ValueError("Enter a Jira PAT")
 
     return {
         "Authorization": f"Bearer {pat}",
@@ -60,16 +63,102 @@ def jira_headers():
     }
 
 
-def load_projects():
+def set_form_enabled(enabled):
+    state = "normal" if enabled else "disabled"
+    for widget in (
+        date_entry,
+        project_entry,
+        team_entry,
+        issue_type,
+        assignee_entry,
+        show_all_issue_types_button,
+        graph_button,
+        story_throughput_button,
+        closure_age_button,
+        bug_story_button,
+        story_points_weekly_button,
+        generate_button,
+        jql_text,
+    ):
+        widget.config(state=state)
+
+
+def invalidate_pat(_event=None):
+    set_form_enabled(False)
+    status_label.config(text="Load Jira Options to validate the PAT")
+
+
+def validate_pat():
+    pat = pat_entry.get().strip()
+    if not pat:
+        set_form_enabled(False)
+        status_label.config(text="Enter a Jira PAT")
+        return
+
+    set_form_enabled(False)
+    load_options_button.config(state="disabled")
+    status_label.config(text="Validating Jira PAT...")
+    threading.Thread(
+        target=validate_pat_thread,
+        args=(pat,),
+        daemon=True
+    ).start()
+
+
+def validate_pat_thread(pat):
+    try:
+        response = requests.get(
+            f"{JIRA_API_URL}/myself",
+            headers=jira_headers(pat),
+            timeout=30
+        )
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        status_code = error.response.status_code if error.response is not None else None
+        root.after(0, lambda: pat_validation_failed(status_code))
+    except Exception:
+        root.after(0, lambda: pat_validation_failed(None))
+    else:
+        root.after(0, lambda: pat_validation_succeeded(pat))
+
+
+def pat_validation_failed(status_code):
+    set_form_enabled(False)
+    load_options_button.config(state="normal")
+    if status_code in (401, 403):
+        status_label.config(text="Invalid Jira PAT")
+    else:
+        status_label.config(text="Could not validate Jira PAT")
+
+
+def pat_validation_succeeded(pat):
+    set_form_enabled(True)
+    load_options_button.config(state="normal")
+    status_label.config(text="Jira PAT valid; loading Jira options...")
+    load_projects(pat)
+    load_issue_types(pat)
+
+
+def load_projects(pat=None):
+    pat = pat or pat_entry.get().strip()
+    if not pat:
+        status_label.config(text="Enter a Jira PAT before loading options")
+        return
+
+    load_options_button.config(state="disabled")
     status_label.config(text="Loading Jira projects...")
-    threading.Thread(target=load_projects_thread, daemon=True).start()
+    threading.Thread(
+        target=load_projects_thread,
+        args=(pat,),
+        daemon=True
+    ).start()
 
 
-def load_projects_thread():
+def load_projects_thread(pat):
     try:
         response = requests.get(
             f"{JIRA_API_URL}/project",
-            headers=jira_headers(),
+            headers=jira_headers(pat),
             timeout=30
         )
         response.raise_for_status()
@@ -85,7 +174,13 @@ def load_projects_thread():
 
         root.after(0, lambda: set_project_values(projects))
     except Exception as error:
-        root.after(0, lambda: status_label.config(text=f"Project load error"))
+        root.after(0, project_load_failed)
+
+
+def project_load_failed():
+    set_form_enabled(False)
+    load_options_button.config(state="normal")
+    status_label.config(text="Project load error; check the PAT")
 
 
 def set_project_values(projects):
@@ -96,6 +191,7 @@ def set_project_values(projects):
         for key, name in projects
     ]
     project_entry["values"] = project_options
+    load_options_button.config(state="normal")
     status_label.config(text=f"Loaded {len(projects)} Jira projects")
     load_components()
     load_assignees()
@@ -127,24 +223,24 @@ project_entry.bind("<KeyRelease>", filter_projects)
 project_entry.bind("<<ComboboxSelected>>", select_project)
 
 # Team
-tk.Label(root, text="Team (Component)").grid(row=2, column=0, padx=8, pady=4)
+tk.Label(root, text="Team (Component)").grid(row=4, column=0, padx=8, pady=4)
 team_entry = ttk.Combobox(root, width=37)
-team_entry.grid(row=2, column=1, padx=8, pady=4)
+team_entry.grid(row=4, column=1, padx=8, pady=4)
 
 # Issue Type
-tk.Label(root, text="Issue Type").grid(row=3, column=0, padx=8, pady=4)
+tk.Label(root, text="Issue Type").grid(row=5, column=0, padx=8, pady=4)
 issue_type = ttk.Combobox(
     root,
     values=issue_options
 )
 issue_type.current(0)
-issue_type.grid(row=3, column=1, padx=8, pady=4)
+issue_type.grid(row=5, column=1, padx=8, pady=4)
 show_all_issue_types_var = tk.BooleanVar(value=False)
 
 #Assignee selection
-tk.Label(root, text="Assignees").grid(row=4, column=0, padx=8, pady=4)
+tk.Label(root, text="Assignees").grid(row=6, column=0, padx=8, pady=4)
 assignee_entry = ttk.Combobox(root, width=37)
-assignee_entry.grid(row=4, column=1, padx=8, pady=4)
+assignee_entry.grid(row=6, column=1, padx=8, pady=4)
 
 
 def selected_project_keys():
@@ -165,15 +261,16 @@ def filter_options(entry, options):
 
 
 def load_components():
+    pat = pat_entry.get().strip()
     status_label.config(text="Loading Jira components...")
     threading.Thread(
         target=load_components_thread,
-        args=(selected_project_keys(),),
+        args=(selected_project_keys(), pat),
         daemon=True
     ).start()
 
 
-def load_components_thread(project_keys):
+def load_components_thread(project_keys, pat):
     try:
         if not project_keys:
             raise ValueError("Enter a project before loading components")
@@ -182,7 +279,7 @@ def load_components_thread(project_keys):
         for project_key in project_keys:
             response = requests.get(
                 f"{JIRA_API_URL}/project/{project_key}/components",
-                headers=jira_headers(),
+                headers=jira_headers(pat),
                 timeout=30
             )
             response.raise_for_status()
@@ -204,15 +301,16 @@ def set_component_values(components):
 
 
 def load_assignees():
+    pat = pat_entry.get().strip()
     status_label.config(text="Loading Jira assignees...")
     threading.Thread(
         target=load_assignees_thread,
-        args=(selected_project_keys(),),
+        args=(selected_project_keys(), pat),
         daemon=True
     ).start()
 
 
-def load_assignees_thread(project_keys):
+def load_assignees_thread(project_keys, pat):
     try:
         if not project_keys:
             raise ValueError("Enter a project before loading assignees")
@@ -221,7 +319,7 @@ def load_assignees_thread(project_keys):
         for project_key in project_keys:
             response = requests.get(
                 f"{JIRA_API_URL}/user/assignable/search",
-                headers=jira_headers(),
+                headers=jira_headers(pat),
                 params={"project": project_key, "maxResults": 1000},
                 timeout=30
             )
@@ -244,16 +342,25 @@ def set_assignee_values(assignees):
     status_label.config(text=f"Loaded {len(assignees)} Jira assignees")
 
 
-def load_issue_types():
+def load_issue_types(pat=None):
+    pat = pat or pat_entry.get().strip()
+    if not pat:
+        status_label.config(text="Enter a Jira PAT before loading options")
+        return
+
     status_label.config(text="Loading Jira issue types...")
-    threading.Thread(target=load_issue_types_thread, daemon=True).start()
+    threading.Thread(
+        target=load_issue_types_thread,
+        args=(pat,),
+        daemon=True
+    ).start()
 
 
-def load_issue_types_thread():
+def load_issue_types_thread(pat):
     try:
         response = requests.get(
             f"{JIRA_API_URL}/issuetype",
-            headers=jira_headers(),
+            headers=jira_headers(pat),
             timeout=30
         )
         response.raise_for_status()
@@ -287,12 +394,13 @@ def update_issue_type_options():
         issue_type.set("All")
 
 
-ttk.Checkbutton(
+show_all_issue_types_button = ttk.Checkbutton(
     root,
     text="Show all issue types",
     variable=show_all_issue_types_var,
     command=update_issue_type_options
-).grid(row=3, column=2, padx=8, pady=4, sticky="w")
+)
+show_all_issue_types_button.grid(row=5, column=2, padx=8, pady=4, sticky="w")
 
 
 def select_assignee(_event):
@@ -313,22 +421,34 @@ issue_type.bind(
     lambda event: filter_options(event.widget, issue_options)
 )
 
-root.after(100, load_projects)
-root.after(100, load_issue_types)
+def load_options():
+    validate_pat()
 
-#JQL Text box
-tk.Label(root, text="JQL").grid(row=8, column=0, padx=8, pady=4)
+
+load_options_button = ttk.Button(
+    root,
+    text="Load Jira Options",
+    command=load_options
+)
+load_options_button.grid(row=1, column=2, columnspan=2, padx=8, pady=4)
+pat_entry.bind("<KeyRelease>", invalidate_pat)
+
+# JQL Text box
+tk.Label(
+    root,
+    text="JQL (Optional: Manually edit JQL below)"
+).grid(row=10, column=0, columnspan=3, padx=8, pady=4, sticky="w")
 jql_text = tk.Text(
     root,
     height=8,
     width=60
 )
 jql_text.grid(
-    row=9,
+    row=11,
     column=0,
     columnspan=3,
-    padx=8,
-    pady=4
+    padx=0,
+    pady=0
 )
 
 #Graph selection
@@ -342,30 +462,34 @@ bug_story_var = tk.BooleanVar(value=False)
 story_points_weekly_var = tk.BooleanVar(value=False)
 
 
-ttk.Checkbutton(
+story_throughput_button = ttk.Checkbutton(
     graph_frame,
     text="Story Throughput and Aging",
     variable=story_throughput_var
-).pack(anchor="w", padx=5, pady=2)
+)
+story_throughput_button.pack(anchor="w", padx=5, pady=2)
 
-ttk.Checkbutton(
+closure_age_button = ttk.Checkbutton(
     graph_frame,
     text="Average Age at Closure",
     variable=closure_age_var
-).pack(anchor="w", padx=5, pady=2)
+)
+closure_age_button.pack(anchor="w", padx=5, pady=2)
 
-ttk.Checkbutton(
+bug_story_button = ttk.Checkbutton(
     graph_frame,
     text="Bug Stories Created vs Open",
     variable=bug_story_var
-).pack(anchor="w", padx=5, pady=2)
+)
+bug_story_button.pack(anchor="w", padx=5, pady=2)
 
 
-ttk.Checkbutton(
+story_points_weekly_button = ttk.Checkbutton(
     graph_frame,
     text="Story Points Completed Per Sprint",
     variable=story_points_weekly_var
-).pack(anchor="w", padx=5, pady=2)
+)
+story_points_weekly_button.pack(anchor="w", padx=5, pady=2)
 
 graphs_visible = False
 
@@ -377,7 +501,7 @@ def toggle_graphs():
         graph_button.config(text="▶ Graph Options")
         graphs_visible = False
     else:
-        graph_frame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=8)
+        graph_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=8)
         graph_button.config(text="▼ Graph Options")
         graphs_visible = True
 
@@ -387,7 +511,7 @@ graph_button = ttk.Button(
     command=toggle_graphs
 )
 
-graph_button.grid(row=5, column=0, padx=8, pady=4)
+graph_button.grid(row=7, column=0, padx=8, pady=4)
 
 #================================
 # GENERATE JQL
@@ -480,26 +604,30 @@ def generate_jql():
     print(jql + "\n")
     return jql
 
-#Generate JQL button
-build_jql_button = tk.Button(
-    root,
-    text="Build JQL",
-    command=generate_jql
-)
 
-build_jql_button.grid(
-    row=7,
-    column=0,
-    padx=8,
-    pady=4
-)
+for jql_entry in (date_entry, project_entry, team_entry, assignee_entry):
+    jql_entry.bind(
+        "<KeyRelease>",
+        lambda _event: generate_jql(),
+        add="+"
+    )
+
+for jql_combobox in (project_entry, team_entry, issue_type, assignee_entry):
+    jql_combobox.bind(
+        "<<ComboboxSelected>>",
+        lambda _event: generate_jql(),
+        add="+"
+    )
+
 generate_jql()
     
 def run_report():
     #jql = generate_jql()
-    status_label.config(text="Loading...")
-    progress.start(10)
-    generate_button.config(state="disabled")
+    pat = pat_entry.get().strip()
+    if not pat:
+        status_label.config(text="Enter a Jira PAT before generating a report")
+        return
+
     selected_graphs = []
 
     if story_throughput_var.get():
@@ -514,10 +642,18 @@ def run_report():
     if story_points_weekly_var.get():
         selected_graphs.append("story_points_weekly")
 
+    if not selected_graphs:
+        status_label.config(text="No graphs selected")
+        return
+
+    status_label.config(text="Loading...")
+    progress.start(10)
+    generate_button.config(state="disabled")
     
 
     threading.Thread(
         target=generate_report_thread,
+        args=(pat,),
         daemon=True
     ).start()
 
@@ -531,15 +667,18 @@ generate_button = tk.Button(
 )
 
 generate_button.grid(
-    row=0,
-    column=2,
-    columnspan=2,
-    pady=20
+    row=9,
+    column=1,
+    padx=0,
+    pady=4
 )
 
-def generate_report_thread():
+def generate_report_thread(pat):
 
     try:
+        def update_status(message):
+            root.after(0, lambda: status_label.config(text=message))
+
         jql = jql_text.get(
             "1.0",
             tk.END
@@ -559,12 +698,18 @@ def generate_report_thread():
         if story_points_weekly_var.get():
                 selected_graphs.append("story_points_biweekly")
 
-        generate_report(jql, selected_graphs)
-
-        root.after(
-            0,
-            lambda: status_label.config(text="Report completed")
+        report_result = generate_report(
+            jql,
+            selected_graphs,
+            pat,
+            status_callback=update_status
         )
+
+        if report_result is not False:
+            root.after(
+                0,
+                lambda: status_label.config(text="Report completed")
+            )
 
     except Exception as e:
         root.after(
@@ -588,5 +733,8 @@ progress = ttk.Progressbar(
 )
 
 progress.grid(row=100, column=0, columnspan=2, sticky="ew")
+
+set_form_enabled(False)
+status_label.config(text="Enter Jira Personal Access Token (PAT)")
 
 root.mainloop()
